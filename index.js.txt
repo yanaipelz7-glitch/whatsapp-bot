@@ -1,0 +1,173 @@
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+
+const GOOGLE_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkmM_YQzfE9rZY3tlm51_lSmi1RIYz6HqjWQWZHCkeaSRF23L151OzzKuyogJ0Y4ZIdA/exec';
+
+const client = new Client({
+    authStrategy: new LocalAuth()
+});
+
+const userSessions = {};
+
+// חילוץ טלפון מכל המבנים האפשריים
+function extractPhoneFromAnywhere(msg) {
+    let rawText = '';
+    try {
+        rawText += (msg.vcard || '') + '\n';
+        rawText += (msg.body || '') + '\n';
+        if (msg._data) rawText += JSON.stringify(msg._data) + '\n';
+        if (msg.vcards) rawText += JSON.stringify(msg.vcards) + '\n';
+    } catch (e) {}
+
+    const waidMatch = rawText.match(/waid=(\d{8,15})/i);
+    if (waidMatch) return '+' + waidMatch[1];
+
+    const israelMatch = rawText.match(/9725\d{8}/);
+    if (israelMatch) return '+' + israelMatch[0];
+
+    const localMatch = rawText.match(/05\d[- ]?\d{7}/);
+    if (localMatch) {
+        return '+972' + localMatch[0].replace(/[^\d]/g, '').substring(1);
+    }
+
+    return '';
+}
+
+// שליחה ל-Google Sheets דרך ה-Web App עם קבלת אישור
+async function sendToGoogleSheets(rowData) {
+    try {
+        const response = await fetch(GOOGLE_SCRIPT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify(rowData)
+        });
+        const text = await response.text();
+        console.log('תשובת גוגל שיטס:', text);
+        return text.includes('Success');
+    } catch (err) {
+        console.error('שגיאה בשליחה לשיטס:', err);
+        return false;
+    }
+}
+
+client.on('qr', (qr) => {
+    qrcode.generate(qr, { small: true });
+    console.log('סרוק את קוד ה-QR להתחברות');
+});
+
+client.on('ready', () => {
+    console.log('✅ הבוט מחובר ומחובר ל-Google Sheets!');
+});
+
+client.on('message', async (msg) => {
+    const chatId = msg.from;
+
+    const isVcard = msg.type === 'vcard' || 
+                    msg.type === 'multi_vcard' || 
+                    Boolean(msg.vcard) || 
+                    Boolean(msg._data?.vcard);
+
+    if (isVcard) {
+        try {
+            let name = '';
+            let phone = '';
+
+            try {
+                if (typeof msg.getContacts === 'function') {
+                    const contacts = await msg.getContacts();
+                    if (contacts && contacts.length > 0) {
+                        const c = contacts[0];
+                        name = c.name || c.pushname || c.shortName || '';
+                        phone = c.number || (c.id ? c.id.user : '');
+                    }
+                }
+            } catch (err) {}
+
+            let rawVcard = msg.vcard || msg._data?.vcard || '';
+            if (rawVcard && !name) {
+                const fnMatch = rawVcard.match(/FN[^\r\n:]*:(.+)/i);
+                if (fnMatch) name = fnMatch[1].trim();
+            }
+
+            if (!name) {
+                name = msg._data?.vcardFormattedName || msg._data?.displayName || '';
+            }
+
+            if (!phone) {
+                phone = extractPhoneFromAnywhere(msg);
+            }
+
+            if (!name || name.toUpperCase().includes('VCARD')) {
+                name = 'איש קשר';
+            }
+
+            if (!phone) {
+                phone = 'ללא מספר';
+            }
+
+            userSessions[chatId] = {
+                step: 'ROLE',
+                data: {
+                    date: new Date().toLocaleString('he-IL'),
+                    sender: msg._data?.notifyName || chatId.split('@')[0],
+                    name: name,
+                    phone: phone,
+                    extra: '',
+                    role: '',
+                    companyName: '',
+                    location: ''
+                }
+            };
+
+            await msg.reply(`קלטתי את איש הקשר: *${userSessions[chatId].data.name}*\n📱 טלפון: *${userSessions[chatId].data.phone}*\n\n1️⃣ מה הדרג? (השב: *מנהל* / *עובד*)`);
+        } catch (err) {
+            console.error('שגיאה:', err);
+        }
+        return;
+    }
+
+    if (userSessions[chatId]) {
+        const session = userSessions[chatId];
+
+        if (session.step === 'ROLE') {
+            session.data.role = msg.body.trim();
+            session.step = 'COMPANY_NAME';
+            await msg.reply('2️⃣ מה שם החברה?');
+        }
+        else if (session.step === 'COMPANY_NAME') {
+            session.data.companyName = msg.body.trim();
+            session.step = 'LOCATION';
+            await msg.reply('3️⃣ מה מיקום החברה?');
+        } 
+        else if (session.step === 'LOCATION') {
+            session.data.location = msg.body.trim();
+
+            try {
+                const rowData = [
+                    session.data.date,
+                    session.data.sender,
+                    session.data.name,
+                    session.data.phone,
+                    session.data.extra,
+                    session.data.role,
+                    session.data.companyName, // נוסף לגיליון
+                    session.data.location
+                ];
+
+                const success = await sendToGoogleSheets(rowData);
+                if (success) {
+                    await msg.reply(`✅ *הפרטים נשמרו בהצלחה ב-Google Sheets!*`);
+                } else {
+                    await msg.reply(`⚠️ אירעה שגיאה בשמירה לגיליון.`);
+                }
+            } catch (err) {
+                console.error('שגיאה בשמירה לגיליון:', err);
+                await msg.reply('אירעה שגיאה בשמירה לגיליון.');
+            }
+            
+            delete userSessions[chatId];
+        }
+    }
+});
+
+client.initialize();
