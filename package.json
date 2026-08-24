@@ -2,9 +2,9 @@
   "name": "whatsapp-bot",
   "version": "1.0.0",
   "description": "WhatsApp Bot",
-  "main": "index.js",
+  "main": "bot.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node bot.js"
   },
   "dependencies": {
     "qrcode-terminal": "^0.12.0",
